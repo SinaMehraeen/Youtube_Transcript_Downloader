@@ -302,6 +302,9 @@ def download_transcript(
                 # Extract just the text and join into a single string
                 # We use spaces (not newlines) for continuous flowing text
                 full_text = ' '.join([entry['text'] for entry in transcript_data])
+                
+                # Normalize multiple spaces to single space
+                full_text = re.sub(r' +', ' ', full_text)
                 return full_text, "success"
             
             return None, "no_transcript"
