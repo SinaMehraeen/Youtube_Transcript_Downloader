@@ -19,23 +19,35 @@ from pathlib import Path
 
 def clean_text(text: str) -> str:
     """
-    Clean up transcript text by removing extra whitespace.
+    Clean up transcript text by removing extra whitespace and annotations.
     
     Args:
         text: Raw transcript text
     
     Returns:
-        Cleaned text with normalized spacing
+        Cleaned text with normalized spacing and annotations removed
     """
+    # Remove YouTube auto-generated annotations like [Music], [Applause], etc.
+    # This handles various formats: [Music], [ Music ], [MUSIC], etc.
+    text = re.sub(r'\[\s*[Mm]usic\s*\]', '', text)
+    text = re.sub(r'\[\s*[Aa]pplause\s*\]', '', text)
+    text = re.sub(r'\[\s*[Ll]aughter\s*\]', '', text)
+    text = re.sub(r'\[\s*[Cc]heering\s*\]', '', text)
+    text = re.sub(r'\[\s*[Ii]naudible\s*\]', '', text)
+    
+    # Replace all types of whitespace (including non-breaking spaces, tabs, etc.)
+    # with regular spaces first
+    text = re.sub(r'[\t\u00a0\u2000-\u200b\u202f\u205f\u3000]', ' ', text)
+    
+    # Replace all newlines with spaces to create continuous flowing text
+    # (YouTube transcripts have line breaks for each subtitle segment)
+    text = text.replace('\n', ' ')
+    
     # Replace multiple spaces with single space
-    text = re.sub(r' +', ' ', text)
+    text = re.sub(r'[ ]{2,}', ' ', text)
     
-    # Replace multiple newlines with double newline (paragraph break)
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    
-    # Strip leading/trailing whitespace from each line
-    lines = [line.strip() for line in text.split('\n')]
-    text = '\n'.join(lines)
+    # Final pass: ensure no double spaces remain
+    text = re.sub(r'  +', ' ', text)
     
     # Strip overall leading/trailing whitespace
     return text.strip()
