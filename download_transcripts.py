@@ -32,16 +32,104 @@ import sys         # System-specific parameters - for exiting with error codes
 import time        # Time functions - for adding delays between requests
 import random      # Random number generation - for adding randomness to delays
 import argparse    # Command-line argument parsing - handles --limit, --delay, etc.
+import itertools   # For cycling through proxies
 from pathlib import Path  # Object-oriented filesystem paths - easier file handling
 
 # Third-party library imports (installed via pip)
 import scrapetube  # Scrapes YouTube channel pages to get video IDs without API key
 from youtube_transcript_api import YouTubeTranscriptApi  # Fetches video transcripts
+from youtube_transcript_api.proxies import GenericProxyConfig  # For proxy support
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,  # Error when video owner has disabled transcripts
     NoTranscriptFound,    # Error when no transcript exists for the video
     VideoUnavailable,     # Error when video is private, deleted, or region-locked
 )
+
+# =============================================================================
+# PROXY MANAGEMENT
+# =============================================================================
+
+# Global proxy iterator - cycles through proxies indefinitely
+_proxy_cycle = None
+_proxy_list = []
+
+
+def load_proxies(proxy_file: str) -> list:
+    """
+    Load proxies from a text file (one proxy per line).
+    
+    Supported formats:
+    - http://ip:port
+    - http://user:pass@ip:port
+    - socks5://ip:port
+    - ip:port (assumes http://)
+    
+    Args:
+        proxy_file: Path to the proxy list file
+    
+    Returns:
+        List of proxy URLs
+    """
+    proxies = []
+    path = Path(proxy_file)
+    
+    if not path.exists():
+        print(f"⚠️  Proxy file not found: {proxy_file}")
+        return proxies
+    
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):  # Skip empty lines and comments
+                # If no protocol specified, assume http://
+                if not line.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+                    line = f'http://{line}'
+                proxies.append(line)
+    
+    print(f"🔄 Loaded {len(proxies)} proxies from: {path.absolute()}")
+    return proxies
+
+
+def init_proxy_rotation(proxies: list):
+    """
+    Initialize the global proxy rotator.
+    
+    Args:
+        proxies: List of proxy URLs to rotate through
+    """
+    global _proxy_cycle, _proxy_list
+    _proxy_list = proxies
+    if proxies:
+        _proxy_cycle = itertools.cycle(proxies)
+
+
+def get_next_proxy() -> str | None:
+    """
+    Get the next proxy in the rotation.
+    
+    Returns:
+        Next proxy URL, or None if no proxies are configured
+    """
+    global _proxy_cycle
+    if _proxy_cycle:
+        return next(_proxy_cycle)
+    return None
+
+
+def get_proxy_config(proxy_url: str) -> GenericProxyConfig:
+    """
+    Convert a proxy URL to a GenericProxyConfig for youtube-transcript-api.
+    
+    Args:
+        proxy_url: Proxy URL (e.g., 'http://ip:port')
+    
+    Returns:
+        GenericProxyConfig instance
+    """
+    return GenericProxyConfig(
+        http_url=proxy_url,
+        https_url=proxy_url
+    )
 
 
 # =============================================================================
@@ -127,16 +215,6 @@ def extract_channel_identifier(url: str) -> tuple[str, str]:
     if match := re.search(r'youtube\.com/user/([\w-]+)', url):
         return ('user', match.group(1))
     
-    # Match vanity/handle URL format: youtube.com/channelname (no prefix)
-    # This must come after all other specific patterns to avoid false matches
-    # Excludes common YouTube paths that aren't channels
-    excluded_paths = {'watch', 'playlist', 'feed', 'gaming', 'music', 'premium', 
-                      'shorts', 'results', 'about', 'yt', 'howyoutubeworks', 'trends'}
-    if match := re.search(r'youtube\.com/([a-zA-Z][\w-]+)(?:/|$|\?)', url):
-        channel_name = match.group(1)
-        if channel_name.lower() not in excluded_paths:
-            return ('custom', channel_name)
-    
     # Allow shorthand: just @ChannelName without the full URL
     if url.startswith('@'):
         return ('username', url[1:])  # Remove the @ and return the rest
@@ -149,7 +227,6 @@ def extract_channel_identifier(url: str) -> tuple[str, str]:
         "  - https://www.youtube.com/channel/UCxxxxxx\n"
         "  - https://www.youtube.com/c/CustomName\n"
         "  - https://www.youtube.com/user/Username\n"
-        "  - https://www.youtube.com/ChannelName\n"
         "  - @ChannelName"
     )
 
@@ -223,7 +300,8 @@ def download_transcript(
     languages: list = None, 
     retries: int = MAX_RETRIES, 
     manual_only: bool = False,
-    cookies: str = None
+    cookies: str = None,
+    use_proxies: bool = False
 ) -> tuple[str | None, str]:
     """
     Download the transcript for a single YouTube video.
@@ -238,6 +316,7 @@ def download_transcript(
         retries: Number of times to retry if rate limited
         manual_only: If True, skip videos that only have auto-generated captions
         cookies: Path to cookies.txt file for authentication
+        use_proxies: If True, use rotating proxies for requests
     
     Returns:
         A tuple of (transcript_text, status):
@@ -259,17 +338,22 @@ def download_transcript(
     # Retry loop - will attempt up to 'retries' times if rate limited
     for attempt in range(retries):
         try:
-            # Step 1: Create YouTubeTranscriptApi instance (new API in v1.0+)
-            # The old static methods were removed in v1.2.3
-            # Note: Cookie authentication is currently broken in the library (as of v1.2.3)
-            # See: https://pypi.org/project/youtube-transcript-api/
-            ytt_api = YouTubeTranscriptApi()
+            # Get proxy for this attempt if proxies are enabled
+            current_proxy = None
+            proxy_config = None
+            if use_proxies:
+                current_proxy = get_next_proxy()
+                if current_proxy:
+                    proxy_config = get_proxy_config(current_proxy)
             
-            # Step 2: Get list of available transcripts for this video
-            # This returns a TranscriptList object we can query
+            # Create API instance with optional proxy config
+            # v1.x uses instance-based API (cookies no longer supported in v1.x)
+            ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
+            
+            # Step 1: Get list of available transcripts for this video
             transcript_list = ytt_api.list(video_id)
             
-            # Step 3: Try to find the best transcript
+            # Step 2: Try to find the best transcript
             transcript = None
             
             # First, try to find a manually-created transcript (human-made, higher quality)
@@ -289,22 +373,15 @@ def download_transcript(
                     # No transcript at all in our preferred languages
                     return None, "no_transcript_in_language"
             
-            # Step 4: Fetch the actual transcript text
+            # Step 3: Fetch the actual transcript text
             if transcript:
-                # transcript.fetch() returns a FetchedTranscript object (v1.2.3+)
-                # which is iterable and contains FetchedTranscriptSnippet objects
-                fetched_transcript = transcript.fetch()
-                
-                # Use to_raw_data() to get list of dicts, or iterate with .text attribute
-                # We use to_raw_data() for compatibility with the original code structure
-                transcript_data = fetched_transcript.to_raw_data()
+                # transcript.fetch() returns a FetchedTranscript object
+                # Use .to_raw_data() for list of dicts compatibility
+                transcript_data = transcript.fetch()
                 
                 # Extract just the text and join into a single string
-                # We use spaces (not newlines) for continuous flowing text
-                full_text = ' '.join([entry['text'] for entry in transcript_data])
-                
-                # Normalize multiple spaces to single space
-                full_text = re.sub(r' +', ' ', full_text)
+                # transcript_data is iterable with .text attribute on snippets
+                full_text = ' '.join([snippet.text for snippet in transcript_data])
                 return full_text, "success"
             
             return None, "no_transcript"
@@ -326,14 +403,22 @@ def download_transcript(
             # Catch-all for other errors (network issues, rate limiting, etc.)
             error_msg = str(e)
             
-            # Check if this is a rate limiting error (HTTP 429)
-            if "429" in error_msg or "Too Many Requests" in error_msg:
+            # Check if this is a rate limiting error (HTTP 429) or proxy error
+            is_rate_limited = "429" in error_msg or "Too Many Requests" in error_msg
+            is_proxy_error = "proxy" in error_msg.lower() or "connect" in error_msg.lower()
+            
+            if is_rate_limited or is_proxy_error:
                 if attempt < retries - 1:
-                    # Calculate wait time using exponential backoff
-                    # Each retry waits longer: 15s, 30s, 60s, 120s...
-                    wait_time = INITIAL_RETRY_DELAY * (2 ** attempt) + random.uniform(1, 10)
-                    print(f"    ⏳ Rate limited. Waiting {wait_time:.0f}s (retry {attempt + 2}/{retries})...")
-                    time.sleep(wait_time)
+                    if use_proxies and current_proxy:
+                        # With proxies, try the next one immediately
+                        error_type = "Rate limited" if is_rate_limited else "Proxy failed"
+                        print(f"    🔄 {error_type}. Trying next proxy (retry {attempt + 2}/{retries})...")
+                        time.sleep(1)  # Brief pause before trying next proxy
+                    else:
+                        # Without proxies, use exponential backoff
+                        wait_time = INITIAL_RETRY_DELAY * (2 ** attempt) + random.uniform(1, 10)
+                        print(f"    ⏳ Rate limited. Waiting {wait_time:.0f}s (retry {attempt + 2}/{retries})...")
+                        time.sleep(wait_time)
                     continue  # Go to next iteration of retry loop
                 else:
                     # Used all retries, give up
@@ -356,7 +441,8 @@ def download_all_transcripts(
     limit: int = None,
     languages: list = None,
     delay: float = DEFAULT_DELAY,
-    cookies: dict = None
+    cookies: str = None,
+    proxy_file: str = None
 ):
     """
     Download transcripts for all videos on a YouTube channel.
@@ -374,17 +460,28 @@ def download_all_transcripts(
         languages: Preferred transcript languages
         delay: Seconds to wait between each video
         cookies: Path to cookies.txt for authentication
+        proxy_file: Path to file containing proxy list (one per line)
     """
     
     # Create the output directory if it doesn't exist
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
+    # Load proxies if a proxy file is provided
+    use_proxies = False
+    if proxy_file:
+        proxies = load_proxies(proxy_file)
+        if proxies:
+            init_proxy_rotation(proxies)
+            use_proxies = True
+    
     # Print initial status information
     print(f"📁 Saving transcripts to: {output_path.absolute()}")
     print(f"⏱️  Delay between requests: {delay}s")
     if cookies:
         print("🍪 Using cookies for authentication")
+    if use_proxies:
+        print(f"🔄 Proxy rotation enabled ({len(_proxy_list)} proxies)")
     print()
     
     # Get the list of videos from the channel
@@ -417,7 +514,7 @@ def download_all_transcripts(
         
         # Create a safe filename for this video
         safe_title = sanitize_filename(title)
-        filename = f"{safe_title}_{video_id}.txt"  # Include video ID to ensure uniqueness
+        filename = f"{safe_title}_{video_id}.md"  # Include video ID to ensure uniqueness
         filepath = output_path / filename
         
         # Skip if we already downloaded this video
@@ -430,16 +527,22 @@ def download_all_transcripts(
         print(f"[{idx}/{total_videos}] 📄 Processing: {title[:50]}...")
         
         # Attempt to download the transcript
-        transcript, status = download_transcript(video_id, languages, cookies=cookies)
+        transcript, status = download_transcript(
+            video_id, 
+            languages, 
+            cookies=cookies,
+            use_proxies=use_proxies
+        )
         
         if transcript:
-            # Success! Write the transcript to a plain text file
+            # Success! Write the transcript to a Markdown file
             with open(filepath, 'w', encoding='utf-8') as f:
-                # Write simple header with video info
-                f.write(f"{title}\n")
-                f.write(f"Video ID: {video_id}\n")
-                f.write(f"URL: https://www.youtube.com/watch?v={video_id}\n")
-                f.write("\n")
+                # Write Markdown header with video info
+                f.write(f"# {title}\n\n")
+                f.write(f"**Video ID:** `{video_id}`\n\n")
+                f.write(f"**URL:** [Watch on YouTube](https://www.youtube.com/watch?v={video_id})\n\n")
+                f.write("---\n\n")
+                f.write("## Transcript\n\n")
                 f.write(transcript)
             
             print(f"    ✅ Saved: {filename}")
@@ -567,6 +670,14 @@ To avoid rate limiting, export cookies from your browser:
         help="Path to cookies.txt file (Netscape format) to avoid rate limiting"
     )
     
+    # Optional: Proxy file for rotating proxies
+    parser.add_argument(
+        "-p", "--proxies",
+        type=str,
+        default=None,
+        help="Path to proxy list file (one proxy per line) for IP rotation"
+    )
+    
     # Parse the command-line arguments
     args = parser.parse_args()
     
@@ -583,7 +694,8 @@ To avoid rate limiting, export cookies from your browser:
             limit=args.limit,
             languages=args.languages,
             delay=args.delay,
-            cookies=cookies
+            cookies=cookies,
+            proxy_file=args.proxies
         )
     except ValueError as e:
         # Handle invalid channel URL errors
