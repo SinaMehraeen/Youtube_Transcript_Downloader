@@ -1,12 +1,13 @@
 # YouTube Channel Transcript Downloader
 
-A Python tool to download transcripts from all videos on a YouTube channel and process them into clean, formatted files.
+A Python tool to download transcripts from all videos on a YouTube channel, fetch video statistics, clean the content, and save as formatted files - all in one step.
 
 ## Features
 
 - 📺 **Download all transcripts** from any YouTube channel
-- 📝 **Plain text output** with video metadata
-- 🔄 **Post-processing script** to clean and convert to Markdown
+- 📊 **Fetch video statistics** (views, likes, comments) automatically
+- 🧹 **Clean transcript text** (removes [Music], [Applause], etc.)
+- 📝 **Clean formatted output** ready to use
 - 🎯 **Prioritizes manual transcripts** over auto-generated ones
 - ⏱️ **Rate limiting protection** with automatic retries
 - 📁 **Skip existing files** - resume interrupted downloads
@@ -22,11 +23,7 @@ cd youtube_transcript_downloader
 pip install -r requirements.txt
 ```
 
-## Scripts
-
-### 1. Download Transcripts
-
-Downloads transcripts from a YouTube channel as `.txt` files.
+## Quick Start
 
 ```bash
 # Download all transcripts from a channel
@@ -39,17 +36,18 @@ python download_transcripts.py @ChannelName
 python download_transcripts.py https://www.youtube.com/minutephysics
 ```
 
-#### Options
+## Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-o, --output` | Output directory | `transcripts` |
 | `-l, --limit` | Max videos to process | All |
 | `-d, --delay` | Delay between requests (seconds) | `3` |
-| `-c, --cookies` | Path to cookies.txt file | None |
+| `-p, --proxies` | Path to proxy list file | None |
 | `--languages` | Preferred transcript languages | `en en-US en-GB` |
+| `--skip-stats` | Skip fetching video statistics | False |
 
-#### Examples
+## Examples
 
 ```bash
 # Save to custom folder
@@ -63,63 +61,41 @@ python download_transcripts.py @ChannelName --delay 5
 
 # Download Spanish transcripts
 python download_transcripts.py @ChannelName --languages es es-ES
+
+# Skip video statistics (faster download)
+python download_transcripts.py @ChannelName --skip-stats
 ```
 
-### 2. Process Transcripts
+## Output Format
 
-Cleans up transcript files (removes extra whitespace) and converts to formatted Markdown.
+Each transcript is saved as a clean, formatted `.md` file:
 
-```bash
-# Default: reads from 'transcripts', outputs to 'processed_transcripts'
-python process_transcripts.py
-
-# Specify custom directories
-python process_transcripts.py transcripts processed_transcripts
 ```
-
-#### What it does:
-- Removes multiple consecutive spaces
-- Normalizes line breaks
-- Strips leading/trailing whitespace
-- Exports as clean Markdown with proper formatting
-
-## Workflow
-
-1. **Download** transcripts as plain text:
-   ```bash
-   python download_transcripts.py @ChannelName
-   ```
-
-2. **Process** into clean Markdown:
-   ```bash
-   python process_transcripts.py
-   ```
-
-## Output Formats
-
-### Raw transcript (.txt)
-```
-Video Title
+Title: Video Title Here
 Video ID: abc123xyz
 URL: https://www.youtube.com/watch?v=abc123xyz
+View Count: 1234567
+Like Count: 12345
+Favorite Count: 0
+Comment Count: 234
 
-This is the transcript content...
+========================================
+
+This is the cleaned transcript content. All YouTube annotations like 
+music and applause tags have been removed. The text is formatted as 
+a single clean paragraph ready to use.
 ```
 
-### Processed transcript (.md)
-```markdown
-# Video Title
+## What Gets Cleaned
 
-**Video ID:** `abc123xyz`
-
-**URL:** [https://www.youtube.com/watch?v=abc123xyz](https://www.youtube.com/watch?v=abc123xyz)
-
----
-
-## Transcript
-
-This is the cleaned transcript content...
-```
+The script automatically removes common YouTube annotations:
+- `[Music]`, `[Applause]`, `[Laughter]`
+- `[Cheering]`, `[Audience]`, `[Silence]`
+- `[Background music]`, `[Background noise]`
+- `[Intro music]`, `[Outro music]`, `[Theme music]`
+- `[Foreign]`, `[Inaudible]`
+- Musical note symbols (♪)
+- Any other bracketed annotations
 
 ## Avoiding Rate Limiting
 
@@ -131,11 +107,16 @@ YouTube may rate limit requests. If you see "429 Too Many Requests" errors:
 python download_transcripts.py @ChannelName --delay 10
 ```
 
-### Option 2: Wait and Retry
+### Option 2: Use Proxies
+
+```bash
+python download_transcripts.py @ChannelName --proxies proxies.txt
+```
+
+### Option 3: Wait and Retry
 
 Wait 1-2 hours before trying again if heavily rate limited.
 
-> **Note:** Cookie authentication is currently broken in the youtube-transcript-api library (v1.2.3). The `--cookies` option is accepted but may not work.
 
 ## Supported URL Formats
 
@@ -151,6 +132,14 @@ Wait 1-2 hours before trying again if heavily rate limited.
 - Python 3.10+
 - youtube-transcript-api >= 1.0.0
 - scrapetube >= 2.5.0
+- yt-dlp (optional, for video statistics)
+
+## Legacy Scripts
+
+The repository also includes standalone scripts for existing transcripts:
+
+- `analyze_transcripts.py` - Descriptive statistics of transcripts and engagement analysis of channel videos (e.g. like/view ratio, word count, etc.)
+
 
 ## License
 
