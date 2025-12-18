@@ -1,56 +1,293 @@
 """
-YouTube Transcript Analyzer
-===========================
+YouTube Channel Transcript Downloader
+======================================
 
-This script analyzes transcript files to provide statistics and visualizations.
+This script downloads transcripts from all videos on a YouTube channel,
+fetches video statistics, cleans the content, and saves everything as
+clean formatted text files.
 
-Features:
-1. Calculate average channel views from all transcript files
-2. Calculate word count for every transcript
-3. Create a histogram of normalized view counts with quartiles and median
+HOW IT WORKS:
+1. Takes a YouTube channel URL as input
+2. Uses 'scrapetube' library to get a list of all videos on the channel
+3. For each video, uses 'youtube-transcript-api' to fetch the transcript
+4. Uses 'yt-dlp' to fetch video statistics (views, likes, comments)
+5. Cleans the transcript (removes [Music], [Applause], etc.)
+6. Saves each transcript as a clean formatted file
 
-Usage:
-    python analyze_transcripts.py [folder]
-    python analyze_transcripts.py                  # Uses default: cleaned
-    python analyze_transcripts.py cleaned
+OUTPUT FORMAT:
+    Title: Video Title Here
+    Video ID: abc123xyz
+    URL: https://www.youtube.com/watch?v=abc123xyz
+    View Count: 1234567
+    Like Count: 12345
+    Favorite Count: 0
+    Comment Count: 234
+
+    ========================================
+
+    Cleaned transcript text here...
 """
 
+# =============================================================================
+# IMPORTS
+# =============================================================================
+
+import os
 import re
 import sys
+import time
+import random
 import argparse
+import itertools
 from pathlib import Path
-from dataclasses import dataclass
 
-import numpy as np
-import matplotlib.pyplot as plt
+# Third-party library imports
+import scrapetube
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
+from youtube_transcript_api._errors import (
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    VideoUnavailable,
+)
 
-
-# =============================================================================
-# DATA STRUCTURES
-# =============================================================================
-
-@dataclass
-class TranscriptData:
-    """Data extracted from a single transcript file."""
-    filename: str
-    title: str
-    video_id: str
-    view_count: int
-    like_count: int
-    comment_count: int
-    word_count: int
-    transcript_text: str
+try:
+    import yt_dlp
+    YT_DLP_AVAILABLE = True
+except ImportError:
+    YT_DLP_AVAILABLE = False
+    print("⚠️  yt-dlp not installed. Video statistics will not be fetched.")
+    print("   Install with: pip install yt-dlp")
 
 
 # =============================================================================
-# PARSING FUNCTIONS
+# CONFIGURATION CONSTANTS
 # =============================================================================
 
-def parse_transcript_file(filepath: Path) -> TranscriptData | None:
-    """
-    Parse a cleaned transcript file and extract metadata and content.
+DEFAULT_DELAY = 3         # Seconds to wait between processing each video
+MAX_RETRIES = 5           # How many times to retry if we get rate limited
+INITIAL_RETRY_DELAY = 15  # Seconds to wait after first rate limit error
+
+# Common YouTube annotations to remove (case-insensitive)
+ANNOTATIONS_TO_REMOVE = [
+    r'\[music\]',
+    r'\[applause\]', 
+    r'\[laughter\]',
+    r'\[cheering\]',
+    r'\[audience\]',
+    r'\[inaudible\]',
+    r'\[silence\]',
+    r'\[background music\]',
+    r'\[background noise\]',
+    r'\[intro music\]',
+    r'\[outro music\]',
+    r'\[theme music\]',
+    r'\[upbeat music\]',
+    r'\[soft music\]',
+    r'\[dramatic music\]',
+    r'\[foreign\]',
+    r'\[speaking foreign language\]',
+    r'\[♪\]',
+    r'\[♪♪\]',
+    r'\[♪♪♪\]',
+    r'♪',
+]
+
+
+# =============================================================================
+# PROXY MANAGEMENT
+# =============================================================================
+
+_proxy_cycle = None
+_proxy_list = []
+
+
+def load_proxies(proxy_file: str) -> list:
+    """Load proxies from a text file (one proxy per line)."""
+    proxies = []
+    path = Path(proxy_file)
     
-    Expected format:
+    if not path.exists():
+        print(f"⚠️  Proxy file not found: {proxy_file}")
+        return proxies
+    
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                if not line.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+                    line = f'http://{line}'
+                proxies.append(line)
+    
+    print(f"🔄 Loaded {len(proxies)} proxies from: {path.absolute()}")
+    return proxies
+
+
+def init_proxy_rotation(proxies: list):
+    """Initialize the global proxy rotator."""
+    global _proxy_cycle, _proxy_list
+    _proxy_list = proxies
+    if proxies:
+        _proxy_cycle = itertools.cycle(proxies)
+
+
+def get_next_proxy() -> str | None:
+    """Get the next proxy in the rotation."""
+    global _proxy_cycle
+    if _proxy_cycle:
+        return next(_proxy_cycle)
+    return None
+
+
+def get_proxy_config(proxy_url: str) -> GenericProxyConfig:
+    """Convert a proxy URL to a GenericProxyConfig."""
+    return GenericProxyConfig(
+        http_url=proxy_url,
+        https_url=proxy_url
+    )
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def sanitize_filename(title: str) -> str:
+    """Remove characters that aren't allowed in filenames."""
+    sanitized = re.sub(r'[<>:"/\\|?*]', '', title)
+    sanitized = re.sub(r'\s+', ' ', sanitized)
+    return sanitized[:100].strip()
+
+
+def extract_channel_identifier(url: str) -> tuple[str, str]:
+    """Parse a YouTube channel URL and extract the channel identifier."""
+    url = url.strip()
+    
+    if match := re.search(r'youtube\.com/@([\w-]+)', url):
+        return ('username', match.group(1))
+    
+    if match := re.search(r'youtube\.com/channel/(UC[\w-]+)', url):
+        return ('channel_id', match.group(1))
+    
+    if match := re.search(r'youtube\.com/c/([\w-]+)', url):
+        return ('custom', match.group(1))
+    
+    if match := re.search(r'youtube\.com/user/([\w-]+)', url):
+        return ('user', match.group(1))
+    
+    if url.startswith('@'):
+        return ('username', url[1:])
+    
+    raise ValueError(
+        f"Could not parse channel URL: {url}\n"
+        "Supported formats:\n"
+        "  - https://www.youtube.com/@ChannelName\n"
+        "  - https://www.youtube.com/channel/UCxxxxxx\n"
+        "  - https://www.youtube.com/c/CustomName\n"
+        "  - https://www.youtube.com/user/Username\n"
+        "  - @ChannelName"
+    )
+
+
+def get_channel_videos(channel_url: str, limit: int = None):
+    """Get a list of all videos from a YouTube channel."""
+    id_type, identifier = extract_channel_identifier(channel_url)
+    
+    print(f"📺 Fetching videos from channel: {identifier}")
+    
+    if id_type == 'channel_id':
+        videos = scrapetube.get_channel(channel_id=identifier, limit=limit)
+    elif id_type == 'username':
+        videos = scrapetube.get_channel(channel_username=identifier, limit=limit)
+    else:
+        videos = scrapetube.get_channel(channel_url=channel_url, limit=limit)
+    
+    return videos
+
+
+
+
+# =============================================================================
+# TEXT CLEANING FUNCTIONS
+# =============================================================================
+
+def clean_transcript_text(text: str) -> str:
+    """
+    Clean transcript text by removing annotations and fixing formatting.
+    Returns a single continuous paragraph of text.
+    """
+    cleaned = text
+    
+    # Remove YouTube annotations (case-insensitive)
+    for annotation in ANNOTATIONS_TO_REMOVE:
+        cleaned = re.sub(annotation, '', cleaned, flags=re.IGNORECASE)
+    
+    # Remove any other bracketed annotations
+    cleaned = re.sub(r'\[[^\]]*\]', '', cleaned)
+    
+    # Replace all newlines and carriage returns with spaces
+    cleaned = re.sub(r'[\r\n]+', ' ', cleaned)
+    
+    # Fix multiple spaces
+    cleaned = re.sub(r'  +', ' ', cleaned)
+    
+    # Remove spaces before punctuation
+    cleaned = re.sub(r'\s+([.,!?;:])', r'\1', cleaned)
+    
+    # Ensure space after punctuation (if followed by letter)
+    cleaned = re.sub(r'([.,!?;:])([A-Za-z])', r'\1 \2', cleaned)
+    
+    # Remove leading/trailing whitespace
+    cleaned = cleaned.strip()
+    
+    return cleaned
+
+
+# =============================================================================
+# VIDEO STATISTICS FUNCTIONS
+# =============================================================================
+
+def get_video_statistics(video_id: str) -> dict | None:
+    """
+    Fetch statistics for a video using yt-dlp.
+    
+    Returns:
+        Dictionary with video statistics, or None if failed
+    """
+    if not YT_DLP_AVAILABLE:
+        return None
+    
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'skip_download': True,
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            return {
+                'view_count': info.get('view_count', 0) or 0,
+                'like_count': info.get('like_count', 0) or 0,
+                'favorite_count': 0,  # YouTube doesn't expose this anymore
+                'comment_count': info.get('comment_count', 0) or 0,
+            }
+    except Exception:
+        return None
+
+
+# =============================================================================
+# OUTPUT FORMATTING
+# =============================================================================
+
+def format_output_file(title: str, video_id: str, transcript: str, stats: dict | None) -> str:
+    """
+    Format the cleaned transcript with metadata header in the clean output format.
+    
+    Output format:
         Title: Video Title Here
         Video ID: abc123xyz
         URL: https://www.youtube.com/watch?v=abc123xyz
@@ -61,429 +298,260 @@ def parse_transcript_file(filepath: Path) -> TranscriptData | None:
 
         ========================================
 
-        Transcript text here...
+        Cleaned transcript text here...
     """
-    try:
-        content = filepath.read_text(encoding='utf-8')
-        lines = content.split('\n')
-        
-        # Initialize values
-        title = ""
-        video_id = ""
-        view_count = 0
-        like_count = 0
-        comment_count = 0
-        transcript_text = ""
-        
-        separator_found = False
-        transcript_lines = []
-        
-        for line in lines:
-            line_stripped = line.strip()
+    output = []
+    
+    # Add metadata section
+    output.append(f"Title: {title}")
+    output.append(f"Video ID: {video_id}")
+    output.append(f"URL: https://www.youtube.com/watch?v={video_id}")
+    
+    # Add video stats if available
+    if stats:
+        output.append(f"View Count: {stats['view_count']}")
+        output.append(f"Like Count: {stats['like_count']}")
+        output.append(f"Favorite Count: {stats['favorite_count']}")
+        output.append(f"Comment Count: {stats['comment_count']}")
+    
+    # Add separator
+    output.append('')
+    output.append('=' * 40)
+    output.append('')
+    
+    # Add cleaned transcript
+    cleaned_transcript = clean_transcript_text(transcript)
+    output.append(cleaned_transcript)
+    
+    return '\n'.join(output)
+
+
+# =============================================================================
+# CORE TRANSCRIPT DOWNLOAD FUNCTION
+# =============================================================================
+
+def download_transcript(
+    video_id: str, 
+    languages: list = None, 
+    retries: int = MAX_RETRIES, 
+    manual_only: bool = False,
+    use_proxies: bool = False
+) -> tuple[str | None, str]:
+    """
+    Download the transcript for a single YouTube video.
+    
+    Returns:
+        A tuple of (transcript_text, status)
+    """
+    if languages is None:
+        languages = ['en', 'en-US', 'en-GB']
+    
+    for attempt in range(retries):
+        try:
+            current_proxy = None
+            proxy_config = None
+            if use_proxies:
+                current_proxy = get_next_proxy()
+                if current_proxy:
+                    proxy_config = get_proxy_config(current_proxy)
             
-            # Parse metadata
-            if line_stripped.startswith('Title:'):
-                title = line_stripped[6:].strip()
-            elif line_stripped.startswith('Video ID:'):
-                video_id = line_stripped[9:].strip()
-            elif line_stripped.startswith('View Count:'):
-                match = re.search(r'(\d+)', line_stripped)
-                if match:
-                    view_count = int(match.group(1))
-            elif line_stripped.startswith('Like Count:'):
-                match = re.search(r'(\d+)', line_stripped)
-                if match:
-                    like_count = int(match.group(1))
-            elif line_stripped.startswith('Comment Count:'):
-                match = re.search(r'(\d+)', line_stripped)
-                if match:
-                    comment_count = int(match.group(1))
-            elif line_stripped.startswith('=' * 10):
-                separator_found = True
-            elif separator_found:
-                transcript_lines.append(line)
+            ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
+            transcript_list = ytt_api.list(video_id)
+            
+            transcript = None
+            
+            try:
+                transcript = transcript_list.find_manually_created_transcript(languages)
+            except NoTranscriptFound:
+                if manual_only:
+                    return None, "no_manual_transcript"
+                
+                try:
+                    transcript = transcript_list.find_generated_transcript(languages)
+                except NoTranscriptFound:
+                    return None, "no_transcript_in_language"
+            
+            if transcript:
+                transcript_data = transcript.fetch()
+                full_text = ' '.join([snippet.text for snippet in transcript_data])
+                return full_text, "success"
+            
+            return None, "no_transcript"
         
-        transcript_text = '\n'.join(transcript_lines).strip()
-        word_count = len(transcript_text.split()) if transcript_text else 0
+        except TranscriptsDisabled:
+            return None, "transcripts_disabled"
         
-        return TranscriptData(
-            filename=filepath.name,
-            title=title,
-            video_id=video_id,
-            view_count=view_count,
-            like_count=like_count,
-            comment_count=comment_count,
-            word_count=word_count,
-            transcript_text=transcript_text
-        )
+        except NoTranscriptFound:
+            return None, "no_transcript"
         
-    except Exception as e:
-        print(f"  Error parsing {filepath.name}: {e}")
-        return None
-
-
-def collect_transcript_data(folder: Path) -> list[TranscriptData]:
-    """Collect data from all transcript files in the folder."""
-    data = []
+        except VideoUnavailable:
+            return None, "video_unavailable"
+        
+        except Exception as e:
+            error_msg = str(e)
+            
+            is_rate_limited = "429" in error_msg or "Too Many Requests" in error_msg
+            is_proxy_error = "proxy" in error_msg.lower() or "connect" in error_msg.lower()
+            
+            if is_rate_limited or is_proxy_error:
+                if attempt < retries - 1:
+                    if use_proxies and current_proxy:
+                        error_type = "Rate limited" if is_rate_limited else "Proxy failed"
+                        print(f"    🔄 {error_type}. Trying next proxy (retry {attempt + 2}/{retries})...")
+                        time.sleep(1)
+                    else:
+                        wait_time = INITIAL_RETRY_DELAY * (2 ** attempt) + random.uniform(1, 10)
+                        print(f"    ⏳ Rate limited. Waiting {wait_time:.0f}s (retry {attempt + 2}/{retries})...")
+                        time.sleep(wait_time)
+                    continue
+                else:
+                    return None, "rate_limited"
+            
+            return None, f"error: {error_msg[:80]}"
     
-    md_files = list(folder.glob("*.md"))
-    print(f"Found {len(md_files)} transcript files\n")
-    
-    for filepath in md_files:
-        result = parse_transcript_file(filepath)
-        if result and result.view_count > 0:
-            data.append(result)
-    
-    print(f"Successfully parsed {len(data)} files with valid view counts\n")
-    return data
+    return None, "max_retries_exceeded"
 
 
 # =============================================================================
-# ANALYSIS FUNCTIONS
+# MAIN PROCESSING FUNCTION
 # =============================================================================
 
-def calculate_statistics(data: list[TranscriptData]) -> dict:
-    """Calculate various statistics from the transcript data."""
-    view_counts = [d.view_count for d in data]
-    word_counts = [d.word_count for d in data]
-    
-    stats = {
-        'total_videos': len(data),
-        'total_views': sum(view_counts),
-        'average_views': np.mean(view_counts),
-        'median_views': np.median(view_counts),
-        'std_views': np.std(view_counts),
-        'min_views': min(view_counts),
-        'max_views': max(view_counts),
-        'q1_views': np.percentile(view_counts, 25),
-        'q3_views': np.percentile(view_counts, 75),
-        'average_word_count': np.mean(word_counts),
-        'median_word_count': np.median(word_counts),
-        'min_word_count': min(word_counts),
-        'max_word_count': max(word_counts),
-        'q1_word_count': np.percentile(word_counts, 25),
-        'q3_word_count': np.percentile(word_counts, 75),
-    }
-    
-    return stats
-
-
-def print_statistics(stats: dict, data: list[TranscriptData]):
-    """Print the statistics summary."""
-    print("=" * 60)
-    print("CHANNEL STATISTICS")
-    print("=" * 60)
-    print()
-    
-    print("[*] VIEW STATISTICS")
-    print("-" * 40)
-    print(f"  Total Videos:     {stats['total_videos']:,}")
-    print(f"  Total Views:      {stats['total_views']:,}")
-    print(f"  Average Views:    {stats['average_views']:,.0f}")
-    print(f"  Median Views:     {stats['median_views']:,.0f}")
-    print(f"  Std Deviation:    {stats['std_views']:,.0f}")
-    print(f"  Min Views:        {stats['min_views']:,}")
-    print(f"  Max Views:        {stats['max_views']:,}")
-    print(f"  Q1 (25th %ile):   {stats['q1_views']:,.0f}")
-    print(f"  Q3 (75th %ile):   {stats['q3_views']:,.0f}")
-    print()
-    
-    print("[*] WORD COUNT STATISTICS")
-    print("-" * 40)
-    print(f"  Average Words:    {stats['average_word_count']:,.0f}")
-    print(f"  Median Words:     {stats['median_word_count']:,.0f}")
-
-    
-# =============================================================================
-# VISUALIZATION FUNCTIONS
-# =============================================================================
-
-def create_like_view_ratio_histogram_norm(data: list[TranscriptData], output_path: Path):
+def download_all_transcripts(
+    channel_url: str,
+    output_dir: str = "transcripts",
+    limit: int = None,
+    languages: list = None,
+    delay: float = DEFAULT_DELAY,
+    proxy_file: str = None,
+    skip_stats: bool = False
+):
     """
-    Create a histogram of normalized like-to-view ratios.
-    Shows Q1, median, Q3, and Q4 as dashed lines.
+    Download transcripts for all videos on a YouTube channel.
+    
+    This function:
+    1. Gets the list of videos from the channel
+    2. Downloads each transcript
+    3. Fetches video statistics (views, likes, comments)
+    4. Cleans and formats the output
+    5. Saves as clean formatted files
     """
-    # Calculate like-to-view ratios (only for videos with views > 0)
-    ratios = []
-    for d in data:
-        if d.view_count > 0:
-            ratio = d.like_count / d.view_count
-            ratios.append(ratio)
     
-    if not ratios:
-        print("  No valid like-to-view ratios to plot.")
-        return None
-    
-    # Calculate average ratio for normalization
-    avg_ratio = np.mean(ratios)
-    normalized_ratios = [r / avg_ratio if avg_ratio > 0 else 0 for r in ratios]
-    
-    # Calculate quartiles on normalized data
-    q1_normalized = np.percentile(normalized_ratios, 25)
-    median_normalized = np.percentile(normalized_ratios, 50)
-    q3_normalized = np.percentile(normalized_ratios, 75)
-    
-    # Create figure
-    fig, ax = plt.subplots(figsize=(12, 7))
-    
-    # Create histogram
-    n, bins, patches = ax.hist(
-        normalized_ratios, 
-        bins=50, 
-        edgecolor='white', 
-        linewidth=0.5,
-        color='#2ecc71',
-        alpha=0.7
-    )
-    
-    # Add quartile lines
-    ax.axvline(
-        q1_normalized, 
-        color='orange', 
-        linestyle='--', 
-        linewidth=2, 
-        label=f'Q1 (25th %ile): {q1_normalized:.2f}x'
-    )
-    ax.axvline(
-        q3_normalized, 
-        color='gray', 
-        linestyle='--', 
-        linewidth=2, 
-        label=f'Q3 (75th %ile): {q3_normalized:.2f}x'
-    )
-    
-    # Add median line (red dashed)
-    ax.axvline(
-        median_normalized, 
-        color='red', 
-        linestyle='--', 
-        linewidth=2, 
-        label=f'Median: {median_normalized:.2f}x'
-    )
-    
-    # Labels and title
-    ax.set_xlabel('Normalized Like-to-View Ratio (Ratio / Average Ratio)', fontsize=12)
-    ax.set_ylabel('Number of Videos', fontsize=12)
-    ax.set_title(
-        f'Distribution of Normalized Like-to-View Ratios\n'
-        f'(n={len(ratios):,} videos, avg ratio={avg_ratio:.4f})',
-        fontsize=14,
-        fontweight='bold'
-    )
-    
-    # Add legend
-    ax.legend(loc='upper right', fontsize=10)
-    
-    # Add grid
-    ax.grid(axis='y', alpha=0.3)
-    
-    # Set x-axis limit to focus on the main distribution
-    max_display = min(max(normalized_ratios), 5.0)
-    ax.set_xlim(0, max_display + 0.5)
-    
-    # Adjust layout
-    plt.tight_layout()
-    
-    # Save figure
-    output_file = output_path / "like_view_ratio_histogram.svg"
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    print(f"[+] Like-to-View Ratio Histogram saved to: {output_file.absolute()}")
-    
-    # Show the plot
-    plt.show()
-    
-    return output_file
-
-
-def create_word_count_histogram(data: list[TranscriptData], stats: dict, output_path: Path):
-    """
-    Create a histogram of word counts.
-    Shows Q1, median, and Q3 as dashed lines.
-    """
-    # Get word counts
-    word_counts = [d.word_count for d in data]
-    avg_words = stats['average_word_count']
-    
-    # Calculate quartiles on raw data
-    q1 = np.percentile(word_counts, 25)
-    median = np.percentile(word_counts, 50)
-    q3 = np.percentile(word_counts, 75)
-    
-    # Create figure
-    fig, ax = plt.subplots(figsize=(12, 7))
-    
-    # Create histogram
-    n, bins, patches = ax.hist(
-        word_counts, 
-        bins=50, 
-        edgecolor='white', 
-        linewidth=0.5,
-        color='#e74c3c',
-        alpha=0.7
-    )
-    
-    # Add quartile lines
-    ax.axvline(
-        q1, 
-        color='orange', 
-        linestyle='--', 
-        linewidth=2, 
-        label=f'Q1 (25th %ile): {q1:,.0f}'
-    )
-    ax.axvline(
-        q3, 
-        color='gray', 
-        linestyle='--', 
-        linewidth=2, 
-        label=f'Q3 (75th %ile): {q3:,.0f}'
-    )
-    
-    # Add median line (red dashed)
-    ax.axvline(
-        median, 
-        color='red', 
-        linestyle='--', 
-        linewidth=2, 
-        label=f'Median: {median:,.0f}'
-    )
-    
-    # Labels and title
-    ax.set_xlabel('Word Count', fontsize=12)
-    ax.set_ylabel('Number of Videos', fontsize=12)
-    ax.set_title(
-        f'Distribution of Word Counts'
-        f'(n={len(data):,} videos, avg words={avg_words:,.0f})',
-        fontsize=14,
-        fontweight='bold'
-    )
-    
-    # Add legend
-    ax.legend(loc='upper right', fontsize=10)
-    
-    # Add grid
-    ax.grid(axis='y', alpha=0.3)
-    
-    # Adjust layout
-    plt.tight_layout()
-    
-    # Save figure
-    output_file = output_path / "word_count_histogram.svg"
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"[+] Word Count Histogram saved to: {output_file.absolute()}")
-    
-    # Show the plot
-    plt.show()
-    
-    return output_file
-
-def create_like_view_ratio_histogram_raw(data: list[TranscriptData], output_path: Path):
-    """
-    Create a histogram of raw like-to-view ratios. Not normalized
-    Shows Q1, median, and Q3 as dashed lines.
-    """
-    # Calculate like-to-view ratios
-    ratios = [
-        d.like_count / d.view_count
-        for d in data
-        if d.view_count > 0
-    ]
-
-    if not ratios:
-        print("  No valid like-to-view ratios to plot.")
-        return None
-
-    # Calculate statistics
-    avg_ratio = np.mean(ratios)
-    q1 = np.percentile(ratios, 25)
-    median = np.percentile(ratios, 50)
-    q3 = np.percentile(ratios, 75)
-
-    # Create figure
-    fig, ax = plt.subplots(figsize=(12, 7))
-
-    # Histogram
-    ax.hist(
-        ratios,
-        bins=50,
-        edgecolor="white",
-        linewidth=0.5,
-        color="#2ecc71",
-        alpha=0.7
-    )
-
-    # Quartile & median lines
-    ax.axvline(q1, color="orange", linestyle="--", linewidth=2,
-               label=f"Q1 (25th %ile): {q1:.4f}")
-    ax.axvline(median, color="red", linestyle="--", linewidth=2,
-               label=f"Median: {median:.4f}")
-    ax.axvline(q3, color="gray", linestyle="--", linewidth=2,
-               label=f"Q3 (75th %ile): {q3:.4f}")
-
-    # Labels & title
-    ax.set_xlabel("Like-to-View Ratio", fontsize=12)
-    ax.set_ylabel("Number of Videos", fontsize=12)
-    ax.set_title(
-        f"Distribution of Like-to-View Ratios\n"
-        f"(n={len(ratios):,} videos, avg ratio={avg_ratio:.4f})",
-        fontsize=14,
-        fontweight="bold"
-    )
-
-    ax.legend(loc="upper right", fontsize=10)
-    ax.grid(axis="y", alpha=0.3)
-
-    plt.tight_layout()
-
-    # Save
-    output_file = output_path / "like_view_ratio_histogram_raw.svg"
-    plt.savefig(output_file, dpi=150, bbox_inches="tight")
-    print(f"[+] Raw Like-to-View Ratio Histogram saved to: {output_file.absolute()}")
-
-    plt.show()
-
-    return output_file
-
-# =============================================================================
-# MAIN FUNCTION
-# =============================================================================
-
-def analyze_transcripts(folder: str = "cleaned", output_dir: str = None):
-    """Main function to analyze transcripts."""
-    folder_path = Path(folder)
-    
-    if not folder_path.exists():
-        print(f"Error: Folder not found: {folder_path.absolute()}")
-        sys.exit(1)
-    
-    # Set output directory (default: current working directory / main folder)
-    if output_dir:
-        output_path = Path(output_dir)
-    else:
-        output_path = Path(".")  # Main folder instead of input folder
+    output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    print(f"[>] Analyzing transcripts in: {folder_path.absolute()}")
+    # Load proxies if provided
+    use_proxies = False
+    if proxy_file:
+        proxies = load_proxies(proxy_file)
+        if proxies:
+            init_proxy_rotation(proxies)
+            use_proxies = True
+    
+    # Print initial status
+    print(f"📁 Saving transcripts to: {output_path.absolute()}")
+    print(f"⏱️  Delay between requests: {delay}s")
+    if use_proxies:
+        print(f"🔄 Proxy rotation enabled ({len(_proxy_list)} proxies)")
+    if skip_stats:
+        print("📊 Skipping video statistics")
+    elif not YT_DLP_AVAILABLE:
+        print("📊 Video statistics disabled (yt-dlp not installed)")
     print()
     
-    # Collect data
-    data = collect_transcript_data(folder_path)
+    # Get the list of videos
+    videos = get_channel_videos(channel_url, limit)
+    video_list = list(videos)
+    total_videos = len(video_list)
+    print(f"📊 Found {total_videos} videos to process\n")
     
-    if not data:
-        print("No valid transcript files found with view counts.")
+    if total_videos == 0:
+        print("❌ No videos found. Check the channel URL.")
         return
     
-    # Calculate statistics
-    stats = calculate_statistics(data)
+    # Initialize counters
+    success_count = 0
+    fail_count = 0
+    skipped_count = 0
+    rate_limit_count = 0
     
-    # Print statistics
-    print_statistics(stats, data)
+    # Process each video
+    for idx, video in enumerate(video_list, 1):
+        video_id = video['videoId']
+        title = video.get('title', {}).get('runs', [{}])[0].get('text', video_id)
+        
+        safe_title = sanitize_filename(title)
+        filename = f"{safe_title}_{video_id}.md"
+        filepath = output_path / filename
+        
+        # Skip if already downloaded
+        if filepath.exists():
+            safe_name = title.encode('ascii', errors='replace').decode('ascii')[:50]
+            print(f"[{idx}/{total_videos}] ⏭️  Skipping (exists): {safe_name}...")
+            skipped_count += 1
+            continue
+        
+        # Show progress (with safe filename for console)
+        safe_name = title.encode('ascii', errors='replace').decode('ascii')[:50]
+        print(f"[{idx}/{total_videos}] 📄 Processing: {safe_name}...")
+        
+        # Download transcript
+        transcript, status = download_transcript(
+            video_id, 
+            languages, 
+            use_proxies=use_proxies
+        )
+        
+        if transcript:
+            # Fetch video statistics (unless disabled)
+            stats = None
+            if not skip_stats and YT_DLP_AVAILABLE:
+                stats = get_video_statistics(video_id)
+            
+            # Format and save the output
+            output_content = format_output_file(title, video_id, transcript, stats)
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(output_content)
+            
+            stats_info = ""
+            if stats:
+                stats_info = f" (Views: {stats['view_count']:,})"
+            print(f"    ✅ Saved: {filename[:60]}...{stats_info}")
+            success_count += 1
+        else:
+            status_messages = {
+                "no_transcript": "No transcript available",
+                "no_manual_transcript": "Only auto-generated (skipped)",
+                "no_transcript_in_language": "No transcript in preferred language",
+                "transcripts_disabled": "Transcripts disabled",
+                "video_unavailable": "Video unavailable",
+                "rate_limited": "Rate limited (try again later)",
+                "max_retries_exceeded": "Max retries exceeded",
+            }
+            msg = status_messages.get(status, status)
+            print(f"    ❌ {msg}")
+            fail_count += 1
+            
+            if status == "rate_limited":
+                rate_limit_count += 1
+                if rate_limit_count >= 3:
+                    print("\n⚠️  Too many rate limits. Consider:")
+                    print("   1. Wait 1-2 hours before trying again")
+                    print("   2. Use a VPN to change your IP address")
+                    break
+        
+        # Wait before next video
+        if idx < total_videos:
+            actual_delay = delay + random.uniform(1, 3)
+            time.sleep(actual_delay)
     
-
-    # Create histogram
-    print("[>] Creating histograms...")
-    create_like_view_ratio_histogram_norm(data, output_path)
-    create_word_count_histogram(data, stats, output_path)
-    create_like_view_ratio_histogram_raw(data, output_path)
+    # Print final summary
+    print(f"\n{'='*50}")
+    print(f"✨ Done! Results:")
+    print(f"    ✅ Downloaded: {success_count}")
+    print(f"    ⏭️  Skipped (existing): {skipped_count}")
+    print(f"    ❌ Failed: {fail_count}")
+    print(f"📁 Files saved to: {output_path.absolute()}")
 
 
 # =============================================================================
@@ -491,34 +559,96 @@ def analyze_transcripts(folder: str = "cleaned", output_dir: str = None):
 # =============================================================================
 
 def main():
-    """Command-line interface."""
+    """Entry point for the command-line interface."""
+    
     parser = argparse.ArgumentParser(
-        description="Analyze YouTube transcript files for statistics and visualizations.",
+        description="Download YouTube channel transcripts with statistics (cleaned output).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python analyze_transcripts.py
-  python analyze_transcripts.py cleaned
-  python analyze_transcripts.py transcripts --output reports
+  python download_transcripts.py https://www.youtube.com/@ChannelName
+  python download_transcripts.py @ChannelName -o my_transcripts
+  python download_transcripts.py @ChannelName --limit 10 --delay 5
+  python download_transcripts.py @ChannelName --skip-stats
+
+Output format:
+  Title: Video Title
+  Video ID: abc123xyz
+  URL: https://www.youtube.com/watch?v=abc123xyz
+  View Count: 1234567
+  Like Count: 12345
+  Favorite Count: 0
+  Comment Count: 234
+
+  ========================================
+
+  Cleaned transcript text...
         """
     )
     
     parser.add_argument(
-        "folder",
-        nargs="?",
-        default="cleaned",
-        help="Folder containing transcript files (default: cleaned)"
+        "channel_url",
+        help="YouTube channel URL or @username"
     )
     
     parser.add_argument(
         "-o", "--output",
+        default="transcripts",
+        help="Output directory for transcripts (default: transcripts)"
+    )
+    
+    parser.add_argument(
+        "-l", "--limit",
+        type=int,
         default=None,
-        help="Output directory for generated files (default: same as input folder)"
+        help="Maximum number of videos to process (default: all)"
+    )
+    
+    parser.add_argument(
+        "--languages",
+        nargs="+",
+        default=['en', 'en-US', 'en-GB'],
+        help="Preferred transcript languages (default: en en-US en-GB)"
+    )
+    
+    parser.add_argument(
+        "-d", "--delay",
+        type=float,
+        default=DEFAULT_DELAY,
+        help=f"Delay between requests in seconds (default: {DEFAULT_DELAY})"
+    )
+    
+    parser.add_argument(
+        "-p", "--proxies",
+        type=str,
+        default=None,
+        help="Path to proxy list file (one proxy per line) for IP rotation"
+    )
+    
+    parser.add_argument(
+        "--skip-stats",
+        action="store_true",
+        help="Skip fetching video statistics (faster, but no view/like counts)"
     )
     
     args = parser.parse_args()
     
-    analyze_transcripts(folder=args.folder, output_dir=args.output)
+    try:
+        download_all_transcripts(
+            channel_url=args.channel_url,
+            output_dir=args.output,
+            limit=args.limit,
+            languages=args.languages,
+            delay=args.delay,
+            proxy_file=args.proxies,
+            skip_stats=args.skip_stats
+        )
+    except ValueError as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n\n⏹️  Cancelled by user.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
